@@ -60,3 +60,18 @@ Downloads merge into current directory preserving structure.
 
 Project settings are stored in `.gdvc_config.json` which can be safely committed to git.
 Contains Drive folder URLs, version history, and tracked directories.
+
+**Sample config structure:**
+```json
+{
+  "drive_folder_url": "https://drive.google.com/drive/folders/<sample_folder>",
+  "versions": {
+    "v1.0": {
+      "url": "https://drive.google.com/drive/folders/<sample_folder>",
+      "local_path": "."
+    }
+  },
+  "current_version": "v1.0",
+  "tracked_directories": ["models", "data"]
+}
+```

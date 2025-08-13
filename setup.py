@@ -5,19 +5,26 @@ from setuptools import find_packages, setup
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
 
-with open("requirements.txt", "r", encoding="utf-8") as fh:
+try:
+    with open("requirements.txt", "r", encoding="utf-8") as fh:
+        requirements = [
+            line.strip() for line in fh if line.strip() and not line.startswith("#")
+        ]
+except FileNotFoundError:
     requirements = [
-        line.strip() for line in fh if line.strip() and not line.startswith("#")
+        "google-api-python-client>=2.0.0",
+        "google-auth>=2.0.0", 
+        "gdown>=4.0.0"
     ]
 
 setup(
     name="gdvc-mini",
-    version="1.0.0",
-    author="VSrivatsa",
+    version="1.0.2",
+    author="Vikranth Srivatsa",
     description="Lightweight Google Drive version control tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/VSrivatsa/gdvc-mini",
+    url="https://github.com/vikranth22446/gdvc_mini",
     py_modules=["gdvc_mini"],
     classifiers=[
         "Development Status :: 4 - Beta",
