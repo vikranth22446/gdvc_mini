@@ -1,6 +1,6 @@
 # GDVC Mini
 
-[![PyPI version](https://badge.fury.io/py/gdvc-mini.svg)](https://badge.fury.io/py/gdvc-mini)
+[![PyPI version](https://badge.fury.io/py/gdvc.svg)](https://badge.fury.io/py/gdvc)
 
 Simple version control using Google Drive folders. Simplifes the process of quick iteration and dev sharing within drive.
 
