@@ -2,23 +2,35 @@
 
 [![PyPI version](https://badge.fury.io/py/gdvc-mini.svg)](https://badge.fury.io/py/gdvc-mini)
 
-Simple version control using Google Drive folders. 
-I wanted something in between rclone and dvc
+Simple version control using Google Drive folders. Simplifes the process of quick iteration and dev sharing within drive.
+
+A simplified midway between [dvc](https://dvc.org/)/[rclone](https://rclone.org/drive/).
+
+#### Alternatives:
+Rclone/DVC:
+1. Rclone/dvc require permissions for downloading and initial setup. This makes others testing a repo harder
+2. DVC also uses a custom file format and doesn't allow for quick downloading for testing
+
+Git LFS:
+1. Limited file storage and no support for custom backends
+
+Note: This is not intended for full model checkpoints, as each version currently duplicates the entire folder.
 
 ## Install
 ```
 pip install gdvc
 ```
 
-Dev Version:
+dev Version:
 ```
 pip install -e .
 ```
 
-Push to drive setup:
+push to drive setup:
 ```
 gcloud auth application-default login --scopes=https://www.googleapis.com/auth/cloud-platform,https://www.googleapis.com/auth/drive
 ```
+init your drive folder:
 ```
 gdvc init https://drive.google.com/drive/folders/YOUR_FOLDER_ID
 ```
@@ -32,7 +44,7 @@ gdvc track add data
 gdvc track list
 ```
 
-Upload version: to a private repo
+Upload a version (to your configured private Google Drive folder):
 ```
 gdvc upload v1
 ```
@@ -75,9 +87,11 @@ Contains Drive folder URLs, version history, and tracked directories.
   "versions": {
     "v1.0": {
       "url": "https://drive.google.com/drive/folders/<sample_folder>",
-      "local_path": "."
-    }
-  },
+      "local_path": ".",
+      "is_public": false
+    },
+   },
+  "public_version": "v0",
   "current_version": "v1.0",
   "tracked_directories": ["models", "data"]
 }

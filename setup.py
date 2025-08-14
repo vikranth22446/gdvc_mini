@@ -19,9 +19,9 @@ except FileNotFoundError:
 
 setup(
     name="gdvc-mini",
-    version="1.0.2",
+    version="1.0.3",
     author="Vikranth Srivatsa",
-    description="Lightweight Google Drive version control tool",
+    description="Lightweight Google Drive file upload and version control CLI tool",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/vikranth22446/gdvc_mini",
