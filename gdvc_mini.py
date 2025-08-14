@@ -1,7 +1,9 @@
 import argparse
+import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 from urllib.parse import parse_qs, urlparse
 
@@ -76,6 +78,41 @@ def save_config(data):
     with open(tmp_file, "w") as f:
         json.dump(data, f, indent=2)
     os.replace(tmp_file, CONFIG_FILE)
+
+
+def calculate_md5(file_path):
+    """Calculate MD5 hash of a file."""
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def find_existing_file(drive_service, folder_id, local_file_path, file_name):
+    """Returns (file_id, needs_update) or (None, True) if not found."""
+    try:
+        local_md5 = calculate_md5(local_file_path)
+        results = drive_service.files().list(
+            q=f"'{folder_id}' in parents and name='{file_name}' and trashed=false",
+            fields="files(id, md5Checksum, name)"
+        ).execute()
+        
+        files = results.get('files', [])
+        if not files:
+            return None, True
+        
+        file = files[0]
+        drive_md5 = file.get('md5Checksum')
+        
+        if drive_md5 == local_md5:
+            return file['id'], False
+        else:
+            return file['id'], True
+        
+    except Exception as e:
+        print(f"⚠️ Could not check file {file_name}: {e}")
+        return None, True
 
 
 def is_sensitive_file(file_path):
@@ -181,15 +218,55 @@ def ensure_public_recursive(drive_service, folder_id):
     return failed_items
 
 
-def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_public):
+def get_git_commit_hash():
+    """Get the current git commit hash, or None if not in a git repo."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"], 
+            capture_output=True, 
+            text=True, 
+            timeout=10
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+        return None
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+
+def count_files_recursive(local_path):
+    """Count total files in a directory recursively."""
+    total_files = 0
+    for _, _, files in os.walk(local_path):
+        total_files += len(files)
+    return total_files
+
+
+def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_public, progress_info=None):
     folder_name = os.path.basename(local_path.rstrip(os.sep))
-    folder_metadata = {
-        "name": folder_name,
-        "parents": [parent_folder_id],
-        "mimeType": "application/vnd.google-apps.folder",
-    }
-    folder = drive_service.files().create(body=folder_metadata).execute()
-    folder_id = folder["id"]
+    
+    try:
+        results = drive_service.files().list(
+            q=f"'{parent_folder_id}' in parents and "
+            f"mimeType='application/vnd.google-apps.folder' and "
+            f"name='{folder_name}' and trashed=false"
+        ).execute()
+        existing_folders = results.get('files', [])
+    except Exception:
+        existing_folders = []
+    
+    if existing_folders:
+        folder_id = existing_folders[0]["id"]
+        print(f"📁 Reusing existing folder: {folder_name}")
+    else:
+        folder_metadata = {
+            "name": folder_name,
+            "parents": [parent_folder_id],
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        folder = drive_service.files().create(body=folder_metadata).execute()
+        folder_id = folder["id"]
+        print(f"📁 Created new folder: {folder_name}")
 
     if make_public:
         ensure_public_permission(drive_service, folder_id)
@@ -198,20 +275,41 @@ def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_pu
         item_path = os.path.join(local_path, item)
         if os.path.isfile(item_path):
             try:
-                file_metadata = {"name": item, "parents": [folder_id]}
+                file_id, needs_update = find_existing_file(drive_service, folder_id, item_path, item)
+                
+                if file_id and not needs_update:
+                    if progress_info:
+                        progress_info['current'] += 1
+                        print(f"⚡ Skipped {folder_name}/{item} ({progress_info['current']}/{progress_info['total']})")
+                    continue
+                
                 media = MediaFileUpload(item_path)
-                file = (
-                    drive_service.files()
-                    .create(body=file_metadata, media_body=media)
-                    .execute()
-                )
+                
+                if file_id and needs_update:
+                    drive_service.files().update(fileId=file_id, media_body=media).execute()
+                    if progress_info:
+                        progress_info['current'] += 1
+                        print(f"🔄 Updated {folder_name}/{item} ({progress_info['current']}/{progress_info['total']})")
+                    else:
+                        print(f"🔄 Updated {folder_name}/{item}")
+                else:
+                    file_metadata = {"name": item, "parents": [folder_id]}
+                    file = drive_service.files().create(body=file_metadata, media_body=media).execute()
+                    file_id = file["id"]
+                    if progress_info:
+                        progress_info['current'] += 1
+                        print(f"📤 Uploaded {folder_name}/{item} ({progress_info['current']}/{progress_info['total']})")
+                    else:
+                        print(f"📤 Uploaded {folder_name}/{item}")
+                
                 if make_public:
-                    ensure_public_permission(drive_service, file["id"])
-                print(f"Uploaded {item}")
+                    ensure_public_permission(drive_service, file_id)
             except Exception as e:
-                print(f"Failed to upload {item}: {e}")
+                print(f"⚠️ Failed to upload {item}: {e}")
+                if progress_info:
+                    progress_info['current'] += 1
         elif os.path.isdir(item_path):
-            upload_folder_recursive(drive_service, item_path, folder_id, make_public)
+            upload_folder_recursive(drive_service, item_path, folder_id, make_public, progress_info)
 
     return folder_id
 
@@ -284,12 +382,25 @@ def upload_tracked_version(version_name, make_public=False):
     if make_public:
         ensure_public_permission(drive, version_id)
 
+    total_files = sum(count_files_recursive(dir_name) for dir_name in existing_dirs)
+    progress_info = {"current": 0, "total": total_files}
+    
+    print(f"📊 Found {total_files} files to process across {len(existing_dirs)} directories")
+    
     for dir_name in existing_dirs:
         print(f"📂 Uploading directory: {dir_name}")
-        upload_folder_recursive(drive, dir_name, version_id, make_public)
+        upload_folder_recursive(drive, dir_name, version_id, make_public, progress_info)
 
     public_url = f"https://drive.google.com/drive/folders/{version_id}?usp=sharing"
-    config[KEY_VERSIONS][version_name] = {"url": public_url, "local_path": "."}
+    
+    # Get current git commit hash
+    git_commit = get_git_commit_hash()
+    version_data = {"url": public_url, "local_path": "."}
+    if git_commit:
+        version_data["git_commit"] = git_commit
+        print(f"📝 Git commit: {git_commit[:8]}")
+    
+    config[KEY_VERSIONS][version_name] = version_data
     config[KEY_CURRENT] = version_name
     save_config(config)
 
@@ -346,25 +457,52 @@ def upload_version(local_folder, version_name, make_public=False):
     if make_public:
         ensure_public_permission(drive, version_id)
 
+    total_files = count_files_recursive(local_folder)
+    progress_info = {"current": 0, "total": total_files}
+    
+    print(f"📊 Found {total_files} files to process")
+
     for item in os.listdir(local_folder):
         path = os.path.join(local_folder, item)
         if os.path.isfile(path):
             try:
-                file_metadata = {"name": item, "parents": [version_id]}
+                file_id, needs_update = find_existing_file(drive, version_id, path, item)
+                
+                if file_id and not needs_update:
+                    progress_info['current'] += 1
+                    print(f"⚡ Skipped {os.path.basename(local_folder)}/{item} ({progress_info['current']}/{progress_info['total']})")
+                    continue
+                
                 media = MediaFileUpload(path)
-                file = (
-                    drive.files().create(body=file_metadata, media_body=media).execute()
-                )
+                
+                if file_id and needs_update:
+                    drive.files().update(fileId=file_id, media_body=media).execute()
+                    progress_info['current'] += 1
+                    print(f"🔄 Updated {os.path.basename(local_folder)}/{item} ({progress_info['current']}/{progress_info['total']})")
+                else:
+                    file_metadata = {"name": item, "parents": [version_id]}
+                    file = drive.files().create(body=file_metadata, media_body=media).execute()
+                    file_id = file["id"]
+                    progress_info['current'] += 1
+                    print(f"📤 Uploaded {os.path.basename(local_folder)}/{item} ({progress_info['current']}/{progress_info['total']})")
+                
                 if make_public:
-                    ensure_public_permission(drive, file["id"])
-                print(f"📤 Uploaded {item}")
+                    ensure_public_permission(drive, file_id)
             except Exception as e:
                 print(f"⚠️ Failed to upload {item}: {e}")
+                progress_info['current'] += 1
         elif os.path.isdir(path):
-            upload_folder_recursive(drive, path, version_id, make_public)
+            upload_folder_recursive(drive, path, version_id, make_public, progress_info)
 
     public_url = f"https://drive.google.com/drive/folders/{version_id}?usp=sharing"
-    config[KEY_VERSIONS][version_name] = {"url": public_url, "local_path": "."}
+    
+    git_commit = get_git_commit_hash()
+    version_data = {"url": public_url, "local_path": "."}
+    if git_commit:
+        version_data["git_commit"] = git_commit
+        print(f"📝 Git commit: {git_commit[:8]}")
+    
+    config[KEY_VERSIONS][version_name] = version_data
     config[KEY_CURRENT] = version_name
     save_config(config)
 
