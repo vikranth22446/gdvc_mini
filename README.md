@@ -1,5 +1,7 @@
 # GDVC Mini
 
+[![PyPI version](https://badge.fury.io/py/gdvc-mini.svg)](https://badge.fury.io/py/gdvc-mini)
+
 Simple version control using Google Drive folders. 
 I wanted something in between rclone and dvc
 
