@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 import sys
+import io
 from urllib.parse import parse_qs, urlparse
 
 import gdown
@@ -19,25 +20,26 @@ KEY_CURRENT = "current_version"
 KEY_PUBLIC = "public_version"
 KEY_FOLDER_URL = "drive_folder_url"
 KEY_TRACKED_DIRS = "tracked_directories"
+KEY_IS_PUBLIC = "is_public"
 
 SENSITIVE_PATTERNS = [
-    ".env",
-    ".key",
-    ".pem",
-    ".p12",
-    ".pfx",
-    ".crt",
-    ".cer",
-    "credentials",
-    "secret",
-    "token",
-    "password",
-    "config.json",
-    ".ssh/",
-    "id_rsa",
-    "id_ed25519",
-    ".git/config",
-    "settings.ini",
+    r"\.env$",
+    r"\.key$",
+    r"\.pem$",
+    r"\.p12$",
+    r"\.pfx$",
+    r"\.crt$",
+    r"\.cer$",
+    r"credentials",
+    r"secret",
+    r"token",
+    r"password",
+    r"^config\.json$",
+    r"\.ssh/",
+    r"^id_rsa$",
+    r"^id_ed25519$",
+    r"\.git/config$",
+    r"^settings\.ini$",
 ]
 
 
@@ -60,15 +62,6 @@ def load_config():
         config[KEY_CURRENT] = None
     if KEY_PUBLIC not in config:
         config[KEY_PUBLIC] = None
-
-    migrated = False
-    for ver, data in list(config[KEY_VERSIONS].items()):
-        if isinstance(data, str):
-            config[KEY_VERSIONS][ver] = {"url": data, "local_path": "."}
-            migrated = True
-    if migrated:
-        save_config(config)
-        print("Migrated config to new format with local_path support.")
 
     return config
 
@@ -116,7 +109,20 @@ def find_existing_file(drive_service, folder_id, local_file_path, file_name):
 
 
 def is_sensitive_file(file_path):
-    return any(pattern.lower() in file_path.lower() for pattern in SENSITIVE_PATTERNS)
+    file_path_lower = file_path.lower()
+    return any(re.search(pattern.lower(), file_path_lower) for pattern in SENSITIVE_PATTERNS)
+
+
+def sanitize_filename(filename):
+    """Sanitize filename to prevent path traversal attacks."""
+    # Remove path separators and normalize
+    sanitized = os.path.basename(filename)
+    # Remove any remaining directory traversal attempts
+    sanitized = sanitized.replace('..', '')
+    # Ensure it's not empty after sanitization
+    if not sanitized or sanitized in ('.', '..'):
+        sanitized = 'sanitized_file'
+    return sanitized
 
 
 def scan_for_sensitive_files(local_path, collected=None):
@@ -189,34 +195,6 @@ def ensure_public_permission(drive_service, file_id):
         return False
 
 
-def ensure_public_recursive(drive_service, folder_id):
-    failed_items = []
-
-    if not ensure_public_permission(drive_service, folder_id):
-        failed_items.append(f"folder:{folder_id}")
-
-    try:
-        results = (
-            drive_service.files()
-            .list(q=f"'{folder_id}' in parents and trashed=false")
-            .execute()
-        )
-        items = results.get("files", [])
-        for item in items:
-            if item["mimeType"] == "application/vnd.google-apps.folder":
-                failed_items.extend(ensure_public_recursive(drive_service, item["id"]))
-            elif not ensure_public_permission(drive_service, item["id"]):
-                failed_items.append(f"file:{item['name']}")
-    except Exception as e:
-        error_str = str(e).lower()
-        if "403" in error_str or "forbidden" in error_str:
-            print(f"Access denied listing folder: {e}")
-        else:
-            print(f"Failed to list folder: {e}")
-        failed_items.append(f"folder_listing:{folder_id}")
-
-    return failed_items
-
 
 def get_git_commit_hash():
     """Get the current git commit hash, or None if not in a git repo."""
@@ -240,6 +218,26 @@ def count_files_recursive(local_path):
     for _, _, files in os.walk(local_path):
         total_files += len(files)
     return total_files
+
+
+def save_version_config(config, version_name, version_id, make_public):
+    """Save version configuration to config file."""
+    public_url = f"https://drive.google.com/drive/folders/{version_id}?usp=sharing"
+    
+    git_commit = get_git_commit_hash()
+    version_data = {"url": public_url, "local_path": ".", KEY_IS_PUBLIC: make_public}
+    if git_commit:
+        version_data["git_commit"] = git_commit
+        print(f"📝 Git commit: {git_commit[:8]}")
+    
+    config[KEY_VERSIONS][version_name] = version_data
+    config[KEY_CURRENT] = version_name
+    
+    if make_public:
+        config[KEY_PUBLIC] = version_name
+    
+    save_config(config)
+    return public_url
 
 
 def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_public, progress_info=None):
@@ -302,8 +300,6 @@ def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_pu
                     else:
                         print(f"📤 Uploaded {folder_name}/{item}")
                 
-                if make_public:
-                    ensure_public_permission(drive_service, file_id)
             except Exception as e:
                 print(f"⚠️ Failed to upload {item}: {e}")
                 if progress_info:
@@ -312,6 +308,42 @@ def upload_folder_recursive(drive_service, local_path, parent_folder_id, make_pu
             upload_folder_recursive(drive_service, item_path, folder_id, make_public, progress_info)
 
     return folder_id
+
+
+def create_or_get_version_folder(drive_service, parent_folder_id, version_name, make_public=False):
+    """Create or get existing version folder."""
+    try:
+        results = (
+            drive_service.files()
+            .list(
+                q=f"'{parent_folder_id}' in parents and "
+                f"mimeType='application/vnd.google-apps.folder' and "
+                f"name='{version_name}' and trashed=false"
+            )
+            .execute()
+        )
+        existing = results.get("files", [])
+    except Exception as e:
+        sys.exit(f"❌ Failed to query Drive: {e}")
+
+    if existing:
+        version_folder = existing[0]
+        version_id = version_folder["id"]
+        print(f"Reusing existing version folder '{version_name}' (id={version_id})")
+    else:
+        folder_metadata = {
+            "name": version_name,
+            "parents": [parent_folder_id],
+            "mimeType": "application/vnd.google-apps.folder",
+        }
+        version_folder = drive_service.files().create(body=folder_metadata).execute()
+        version_id = version_folder["id"]
+        print(f"📁 Created version folder '{version_name}'")
+
+    if make_public:
+        ensure_public_permission(drive_service, version_id)
+    
+    return version_id
 
 
 def upload_tracked_version(version_name, make_public=False):
@@ -350,37 +382,7 @@ def upload_tracked_version(version_name, make_public=False):
 
     drive = init_drive_auth()
     parent_folder_id = get_folder_id_from_url(config[KEY_FOLDER_URL])
-
-    try:
-        results = (
-            drive.files()
-            .list(
-                q=f"'{parent_folder_id}' in parents and "
-                f"mimeType='application/vnd.google-apps.folder' and "
-                f"name='{version_name}' and trashed=false"
-            )
-            .execute()
-        )
-        existing = results.get("files", [])
-    except Exception as e:
-        sys.exit(f"❌ Failed to query Drive: {e}")
-
-    if existing:
-        version_folder = existing[0]
-        version_id = version_folder["id"]
-        print(f"Reusing existing version folder '{version_name}' (id={version_id})")
-    else:
-        folder_metadata = {
-            "name": version_name,
-            "parents": [parent_folder_id],
-            "mimeType": "application/vnd.google-apps.folder",
-        }
-        version_folder = drive.files().create(body=folder_metadata).execute()
-        version_id = version_folder["id"]
-        print(f"📁 Created version folder '{version_name}'")
-
-    if make_public:
-        ensure_public_permission(drive, version_id)
+    version_id = create_or_get_version_folder(drive, parent_folder_id, version_name, make_public)
 
     total_files = sum(count_files_recursive(dir_name) for dir_name in existing_dirs)
     progress_info = {"current": 0, "total": total_files}
@@ -391,18 +393,7 @@ def upload_tracked_version(version_name, make_public=False):
         print(f"📂 Uploading directory: {dir_name}")
         upload_folder_recursive(drive, dir_name, version_id, make_public, progress_info)
 
-    public_url = f"https://drive.google.com/drive/folders/{version_id}?usp=sharing"
-    
-    # Get current git commit hash
-    git_commit = get_git_commit_hash()
-    version_data = {"url": public_url, "local_path": "."}
-    if git_commit:
-        version_data["git_commit"] = git_commit
-        print(f"📝 Git commit: {git_commit[:8]}")
-    
-    config[KEY_VERSIONS][version_name] = version_data
-    config[KEY_CURRENT] = version_name
-    save_config(config)
+    public_url = save_version_config(config, version_name, version_id, make_public)
 
     print(f"✅ Uploaded version '{version_name}'")
     print(f"📂 Included directories: {', '.join(existing_dirs)}")
@@ -425,37 +416,7 @@ def upload_version(local_folder, version_name, make_public=False):
     drive = init_drive_auth()
     config = load_config()
     parent_folder_id = get_folder_id_from_url(config[KEY_FOLDER_URL])
-
-    try:
-        results = (
-            drive.files()
-            .list(
-                q=f"'{parent_folder_id}' in parents and "
-                f"mimeType='application/vnd.google-apps.folder' and "
-                f"name='{version_name}' and trashed=false"
-            )
-            .execute()
-        )
-        existing = results.get("files", [])
-    except Exception as e:
-        sys.exit(f"❌ Failed to query Drive: {e}")
-
-    if existing:
-        version_folder = existing[0]
-        version_id = version_folder["id"]
-        print(f"Reusing existing version folder '{version_name}' (id={version_id})")
-    else:
-        folder_metadata = {
-            "name": version_name,
-            "parents": [parent_folder_id],
-            "mimeType": "application/vnd.google-apps.folder",
-        }
-        version_folder = drive.files().create(body=folder_metadata).execute()
-        version_id = version_folder["id"]
-        print(f"📁 Created version folder '{version_name}'")
-
-    if make_public:
-        ensure_public_permission(drive, version_id)
+    version_id = create_or_get_version_folder(drive, parent_folder_id, version_name, make_public)
 
     total_files = count_files_recursive(local_folder)
     progress_info = {"current": 0, "total": total_files}
@@ -486,25 +447,13 @@ def upload_version(local_folder, version_name, make_public=False):
                     progress_info['current'] += 1
                     print(f"📤 Uploaded {os.path.basename(local_folder)}/{item} ({progress_info['current']}/{progress_info['total']})")
                 
-                if make_public:
-                    ensure_public_permission(drive, file_id)
             except Exception as e:
                 print(f"⚠️ Failed to upload {item}: {e}")
                 progress_info['current'] += 1
         elif os.path.isdir(path):
             upload_folder_recursive(drive, path, version_id, make_public, progress_info)
 
-    public_url = f"https://drive.google.com/drive/folders/{version_id}?usp=sharing"
-    
-    git_commit = get_git_commit_hash()
-    version_data = {"url": public_url, "local_path": "."}
-    if git_commit:
-        version_data["git_commit"] = git_commit
-        print(f"📝 Git commit: {git_commit[:8]}")
-    
-    config[KEY_VERSIONS][version_name] = version_data
-    config[KEY_CURRENT] = version_name
-    save_config(config)
+    public_url = save_version_config(config, version_name, version_id, make_public)
 
     print(f"✅ Uploaded version '{version_name}'")
     if make_public:
@@ -513,7 +462,108 @@ def upload_version(local_folder, version_name, make_public=False):
         print("🔒 Uploaded privately. Unauthenticated downloads will NOT work.")
 
 
-def download_version(version_name):
+def count_drive_files_recursive(drive_service, folder_id):
+    """Count total files in a Drive folder recursively."""
+    total_files = 0
+    try:
+        results = drive_service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, mimeType)"
+        ).execute()
+        
+        items = results.get('files', [])
+        for item in items:
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                total_files += count_drive_files_recursive(drive_service, item['id'])
+            else:
+                total_files += 1
+                
+    except Exception:
+        pass
+    
+    return total_files
+
+
+def download_folder_recursive(drive_service, folder_id, output_path, progress_info=None):
+    """Download a folder and its contents recursively using Google Drive API."""
+    try:
+        results = drive_service.files().list(
+            q=f"'{folder_id}' in parents and trashed=false",
+            fields="files(id, name, mimeType, md5Checksum)"
+        ).execute()
+        
+        items = results.get('files', [])
+        if not items:
+            return
+            
+        for item in items:
+            item_name = sanitize_filename(item['name'])
+            item_id = item['id']
+            item_path = os.path.join(output_path, item_name)
+            
+            if item['mimeType'] == 'application/vnd.google-apps.folder':
+                os.makedirs(item_path, exist_ok=True)
+                print(f"📁 Created folder: {item_path}")
+                download_folder_recursive(drive_service, item_id, item_path, progress_info)
+            else:
+                try:
+                    should_download = True
+                    drive_md5 = item.get('md5Checksum')
+                    
+                    if os.path.exists(item_path) and drive_md5:
+                        local_md5 = calculate_md5(item_path)
+                        if local_md5 == drive_md5:
+                            should_download = False
+                            if progress_info:
+                                progress_info['current'] += 1
+                                print(f"⚡ Skipped {item_name} (already up-to-date) ({progress_info['current']}/{progress_info['total']})")
+                            else:
+                                print(f"⚡ Skipped {item_name} (already up-to-date)")
+                    
+                    if should_download:
+                        request = drive_service.files().get_media(fileId=item_id)
+                        file_io = io.BytesIO()
+                        downloader = MediaIoBaseDownload(file_io, request)
+                        
+                        done = False
+                        while done is False:
+                            _, done = downloader.next_chunk()
+                        
+                        os.makedirs(os.path.dirname(item_path), exist_ok=True)
+                        with open(item_path, 'wb') as f:
+                            f.write(file_io.getvalue())
+                        
+                        if drive_md5:
+                            local_md5 = calculate_md5(item_path)
+                            if local_md5 != drive_md5:
+                                print(f"⚠️ MD5 mismatch for {item_name} (expected: {drive_md5}, got: {local_md5})")
+                        
+                        if progress_info:
+                            progress_info['current'] += 1
+                            print(f"📄 Downloaded: {item_name} ({progress_info['current']}/{progress_info['total']})")
+                        else:
+                            print(f"📄 Downloaded: {item_name}")
+                    
+                except Exception as e:
+                    print(f"⚠️ Failed to download {item_name}: {e}")
+                    if progress_info:
+                        progress_info['current'] += 1
+                    
+    except Exception as e:
+        print(f"❌ Error listing folder contents: {e}")
+        raise
+
+
+def is_version_public(config, version_name):
+    """Check if a version was uploaded as public."""
+    if version_name not in config.get(KEY_VERSIONS, {}):
+        return False
+    
+    version_data = config[KEY_VERSIONS][version_name]
+    return version_data.get(KEY_IS_PUBLIC, False)
+
+
+def download_version(version_name, use_private_auth=False):
     config = load_config()
     if version_name not in config[KEY_VERSIONS]:
         sys.exit(f"❌ Version '{version_name}' not found in config.")
@@ -525,29 +575,49 @@ def download_version(version_name):
     os.makedirs(version_path, exist_ok=True)
     print(f"⬇️ Downloading '{version_name}' to {version_path}")
 
-    try:
-        gdown.download_folder(
-            id=folder_id, output=version_path, quiet=False, use_cookies=False
-        )
-        print(f"✅ Downloaded to {version_path}")
-    except Exception as e:
-        msg = str(e)
-        if "permission" in msg.lower() or "403" in msg or "not allowed" in msg.lower():
-            sys.exit("❌ Download failed: This folder is not public.")
-        sys.exit(f"❌ Download failed: {e}")
+    if not use_private_auth and not is_version_public(config, version_name):
+        print(f"⚠️  Version '{version_name}' may not be public. Consider using --private flag.")
+
+    if use_private_auth:
+        print("🔐 Using authenticated download for private repository")
+        try:
+            drive_service = init_drive_auth()
+            
+            total_files = count_drive_files_recursive(drive_service, folder_id)
+            if total_files > 0:
+                progress_info = {"current": 0, "total": total_files}
+                print(f"📊 Found {total_files} files to download")
+                download_folder_recursive(drive_service, folder_id, version_path, progress_info)
+            else:
+                download_folder_recursive(drive_service, folder_id, version_path)
+            
+            print(f"✅ Downloaded to {version_path}")
+        except Exception as e:
+            sys.exit(f"❌ Private download failed: {e}")
+    else:
+        try:
+            gdown.download_folder(
+                id=folder_id, output=version_path, quiet=False, use_cookies=False
+            )
+            print(f"✅ Downloaded to {version_path}")
+        except Exception as e:
+            msg = str(e)
+            if "permission" in msg.lower() or "403" in msg or "not allowed" in msg.lower():
+                sys.exit("❌ Download failed: This folder is not public. Use --private flag for private repositories.")
+            sys.exit(f"❌ Download failed: {e}")
 
 
-def download_latest():
+def download_latest(use_private_auth=False):
     config = load_config()
     latest = config.get(KEY_PUBLIC)
     if not latest:
         sys.exit("❌ No public version set in config.")
     if latest not in config.get(KEY_VERSIONS, {}):
         sys.exit(f"❌ Public version '{latest}' missing from versions map.")
-    download_version(latest)
+    download_version(latest, use_private_auth)
 
 
-def publish_version(version_name, recursive=True):
+def publish_version(version_name):
     config = load_config()
     versions = config.get(KEY_VERSIONS, {})
     if version_name not in versions:
@@ -556,30 +626,16 @@ def publish_version(version_name, recursive=True):
     folder_id = get_folder_id_from_url(versions[version_name]["url"])
     drive = init_drive_auth()
 
-    if recursive:
-        print("Publishing folder and contents (recursive)...")
-        failed_items = ensure_public_recursive(drive, folder_id)
-        if failed_items:
-            print(f"Warning: Failed to publish {len(failed_items)} items:")
-            for item in failed_items[:10]:
-                print(f"  - {item}")
-            if len(failed_items) > 10:
-                print(f"  ... and {len(failed_items) - 10} more")
-        else:
-            print(f"Version '{version_name}' is now fully public.")
-            config[KEY_PUBLIC] = version_name
-            save_config(config)
-            print(f"Set '{version_name}' as the public version.")
+    print("Publishing folder (permissions auto-inherit to contents)...")
+    success = ensure_public_permission(drive, folder_id)
+    if success:
+        print(f"Version '{version_name}' is now public.")
+        config[KEY_VERSIONS][version_name][KEY_IS_PUBLIC] = True
+        config[KEY_PUBLIC] = version_name
+        save_config(config)
+        print(f"Set '{version_name}' as the public version.")
     else:
-        print("Publishing folder only...")
-        success = ensure_public_permission(drive, folder_id)
-        if success:
-            print(f"Version '{version_name}' folder is now public.")
-            config[KEY_PUBLIC] = version_name
-            save_config(config)
-            print(f"Set '{version_name}' as the public version.")
-        else:
-            print(f"Failed to publish version '{version_name}'.")
+        print(f"Failed to publish version '{version_name}'.")
 
 
 def update_to_latest():
@@ -683,13 +739,11 @@ def change_folder_root(new_folder_url):
     if not os.path.exists(CONFIG_FILE):
         sys.exit(f"❌ Config file '{CONFIG_FILE}' not found. Run 'gdvc init' first.")
 
-    # Validate new folder URL
     try:
         new_folder_id = get_folder_id_from_url(new_folder_url)
     except SystemExit:
         sys.exit("❌ Invalid Google Drive folder URL provided.")
 
-    # Load current config
     old_config = load_config()
     current_version = old_config.get(KEY_CURRENT)
     public_version = old_config.get(KEY_PUBLIC)
@@ -698,13 +752,11 @@ def change_folder_root(new_folder_url):
     if not current_version:
         sys.exit("❌ No current version found in config.")
 
-    # Backup old config
     backup_file = CONFIG_FILE + ".backup"
     with open(backup_file, "w") as f:
         json.dump(old_config, f, indent=2)
     print(f"📄 Backed up old config to: {backup_file}")
 
-    # Create new config with only current version
     new_config = {
         KEY_FOLDER_URL: new_folder_url,
         KEY_VERSIONS: {current_version: old_config[KEY_VERSIONS][current_version]},
@@ -713,7 +765,6 @@ def change_folder_root(new_folder_url):
         KEY_TRACKED_DIRS: tracked_dirs,
     }
 
-    # Save new config
     save_config(new_config)
 
     print(f"✅ Changed folder root to: {new_folder_url}")
@@ -821,21 +872,21 @@ Workflow:
     download_parser = subparsers.add_parser(
         "download",
         help="Download a version from Drive",
-        epilog="Examples:\n  gdvc download v1.0\n  gdvc download latest",
+        epilog="Examples:\n  gdvc download v1.0\n  gdvc download latest\n  gdvc download v1.0 --private\n  gdvc download latest --private",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     download_parser.add_argument("version", help='Version name or "latest"')
+    download_parser.add_argument(
+        "--private", action="store_true", help="Use Google Drive auth for private repositories"
+    )
 
     publish_parser = subparsers.add_parser(
         "publish",
         help="Make a version public (sets as downloadable version)",
-        epilog="Examples:\n  gdvc publish v1.0                   # Publish version and contents\n  gdvc publish v1.0 --no-recursive    # Publish folder only",
+        epilog="Examples:\n  gdvc publish v1.0                   # Publish version (permissions auto-inherit)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     publish_parser.add_argument("version_name", help="Version name to publish")
-    publish_parser.add_argument(
-        "--no-recursive", action="store_true", help="Publish folder only, not contents"
-    )
 
     subparsers.add_parser(
         "update",
@@ -887,11 +938,11 @@ Workflow:
             track_parser.print_help()
     elif args.command == "download":
         if args.version.lower() == "latest":
-            download_latest()
+            download_latest(args.private)
         else:
-            download_version(args.version)
+            download_version(args.version, args.private)
     elif args.command == "publish":
-        publish_version(args.version_name, recursive=not args.no_recursive)
+        publish_version(args.version_name)
     elif args.command == "update":
         update_to_latest()
     elif args.command == "change_folder_root":
