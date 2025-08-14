@@ -7,6 +7,11 @@ I wanted something in between rclone and dvc
 
 ## Install
 ```
+pip install gdvc
+```
+
+Dev Version:
+```
 pip install -e .
 ```
 
